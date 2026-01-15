@@ -1,0 +1,90 @@
+name: Build and deploy Lambda container image
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_ACCOUNT: ${{ secrets.ECR_ACCOUNT }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      LAMBDA_FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Ensure ECR repository exists
+        run: |
+          set -e
+          REPO="${ECR_REPOSITORY}"
+          ACCOUNT="${ECR_ACCOUNT}"
+          aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "$REPO" --image-scanning-configuration scanOnPush=true
+          export ECR_URI="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO}"
+          echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
+
+      - name: Set image tags
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+          echo "IMAGE_URI=${ECR_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA::8}" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_URI }},${{ env.ECR_ACCOUNT }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Update or create Lambda function with new image
+        id: update_lambda
+        run: |
+          set -e
+          FN="${LAMBDA_FUNCTION_NAME}"
+          IMAGE_URI="${IMAGE_URI}"
+          # check if function exists
+          if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
+            echo "Function exists; updating image..."
+            aws lambda update-function-code --function-name "$FN" --image-uri "$IMAGE_URI"
+          else
+            echo "Function does not exist. Creating function (requires LAMBDA_ROLE_ARN secret)..."
+            if [ -z "${{ secrets.LAMBDA_ROLE_ARN }}" ]; then
+              echo "ERROR: LAMBDA_ROLE_ARN secret is not set; cannot create function." >&2
+              exit 1
+            fi
+            aws lambda create-function \
+              --function-name "$FN" \
+              --package-type Image \
+              --code ImageUri="$IMAGE_URI" \
+              --role "${{ secrets.LAMBDA_ROLE_ARN }}" \
+              --timeout 15 \
+              --memory-size 512
+          fi
+
+      - name: Ensure public Function URL exists (auth NONE) and print it
+        run: |
+          FN="${LAMBDA_FUNCTION_NAME}"
+          # Attempt to get existing URL config
+          if aws lambda get-function-url-config --function-name "$FN" >/dev/null 2>&1; then
+            echo "Function URL exists; retrieving..."
+            aws lambda get-function-url-config --function-name "$FN" --query FunctionUrl --output text
+          else
+            echo "Creating public Function URL (auth-type NONE) for quick testing..."
+            aws lambda create-function-url-config --function-name "$FN" --auth-type NONE --cors '{"AllowOrigins":["*"]}'
+            aws lambda get-function-url-config --function-name "$FN" --query FunctionUrl --output text
+          fi
